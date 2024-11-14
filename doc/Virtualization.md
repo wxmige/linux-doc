@@ -55,7 +55,7 @@ mount -t 9p tagmount /mnt
 
 #### 桥接网络
 
-要实现桥接网络，在host中必须要支持 CONFIG_VHOST_NET，在guest中必须要支持CONFIG_VIRTIO_NET。
+要实现桥接网络，如果要使用vhost-net加速在host中必须要支持 CONFIG_VHOST_NET，在guest中必须要支持CONFIG_VIRTIO_NET。
 
 首先要将host中的网络改为桥接模式
 
@@ -77,6 +77,12 @@ route del default dev eth0
 ip route add default via 192.168.1.1 dev br0
 ```
 
+如果开启了网络管理服务需要关掉
+
+```bash
+systemctl stop NetworkManager
+```
+
 在host中创建一个tap网卡给guest使用
 
 ```bash
@@ -85,10 +91,16 @@ ip link set tap0 master br0
 ip link set tap0 up
 ```
 
-启动一个guest使用vhost指定桥接模式
+启动一个guest使用vhost-net指定桥接模式
 
 ```bash
 ./lkvm run -k bzImage --disk rootfs.ext4 --9p testdir,tagmount -n mode=tap,tapif=tap0,vhost=1
+```
+
+如果不想使用vhost-net
+
+```bash
+./lkvm run -k bzImage --disk rootfs.ext4 --9p testdir,tagmount -n mode=tap,tapif=tap0
 ```
 
 在guest中使用dhcp配置ip即可正常使用网络
@@ -105,6 +117,12 @@ dhclient eth0
     "iptables": false
 }
 ```
+
+vhost-net是一个专门为kvm和tap桥接服务的模块。
+
+在不使用vhost-net模块时，guest的用户态使用socket将数据发送给guest的内核态的virtio-net驱动，virtio-net驱动获取数据之后会调用read、write将数据通过tap传递给host的内核态，host的内核态网络协议栈再发送给网桥，最终发送给eth0这个真实的物理网卡实现对外通信。
+
+使用vhost-net模块时，guest的用户态使用socket将数据发送给guest的内核态的virtio-net驱动，virtio-net驱动获取数据之后会使用vhost-net实现tap网卡用户态到内核态的数据0拷贝通信，host的内核态网络协议栈再发送给网桥，最终发送给eth0这个真实的物理网卡实现对外通信。
 
 #### PCIE直通
 
@@ -175,6 +193,185 @@ lrwxrwxrwx 1 root root 0 10月30日 14:32 driver -> ../../../../bus/pci/drivers/
 00:00.0 Memory controller: Xilinx Corporation Device 9034
 ```
 
+### qemu
+
+qemu能真正模拟不同的硬件，它支持模拟与host架构硬件同时支持BootLoader启动。直接使用kvm只能通过virtio驱动来模拟硬件，并且无法实现BootLoader支持。
+
+#### 内核启动
+
+```bash
+qemu-system-x86_64 \
+-m 2G -smp 2 -machine accel=kvm -cpu host --nographic \
+-kernel bzImage \
+```
+
+使用 -m 和 -smp 可以指定 guest 的内存大小和使用的核心数。-machine accel=kvm -cpu host即使用 kvm 加速，让模拟 CPU 的核心模块使用kvm实现而无需另外模拟硬件。--nographic 表示不使用图形输出。-kernel bzImage指定运行内核的路径。
+
+在X86上也可以模拟arm64架构的运行运行，但不能使用kvm加速，由于arm64架构的开放性，不同的厂家的芯片差异较大，需要用-M和-cpu参数指定。
+
+```bash
+qemu-system-aarch64 -M virt -cpu cortex-a53 -m 2G --nographic \
+-kernel Image 
+```
+
+#### 指定根文件系统
+
+qemu并没有默认的文件系统，需要手动指定。
+
+```bash
+qemu-system-x86_64 \
+-m 2G -smp 2 -machine accel=kvm -cpu host --nographic \
+-kernel bzImage \
+-device virtio-blk-pci,drive=disk0 -drive file=rootfs.ext4,format=raw,id=disk0,if=none \
+-append "earlycon=pl011,mmio32,0x9000000 console=ttyS0,115200 root=/dev/vda"
+```
+
+与直接使用kvm不同，qemu不会默认使用virtio-blk硬件，而是会自己模拟一个硬盘硬件，可以手动指定使用virtio-blk-pci挂载在disk0上用于硬盘访问加速。
+
+-append 可以指定启动参数，将earlycon打开可以查看启动过程中的内核打印，方便定位启动失败问题，earlycon=pl011,mmio32,0x9000000是qemu默认模拟的串口。指定root=/dev/vda可以指定根文件系统为传入的rootfs.ext4。
+
+#### 网络
+
+##### nat
+
+```bash
+qemu-system-x86_64 \
+-m 2G -smp 2 -machine accel=kvm -cpu host --nographic \
+-kernel bzImage \
+-device virtio-blk-pci, drive=disk0 -drive file=rootfs.ext4,format=raw,id=disk0,if=none \
+-device virtio-net-pci,netdev=net0 -netdev user,hostfwd=tcp::8080-:22 \
+-append "earlycon=pl011,mmio32,0x9000000 console=ttyS0,115200 root=/dev/vda"
+```
+
+同样使用virtio-net-pci设备可以对网卡进行加速，-netdev user表示使用nat模式，hostfwd=tcp::8080-:22表示端口映射，即访问host的8080端口即可访问guest的22端口，即通过访问host的8080端口可以使用ssh访问guest。
+
+```bash
+ssh 127.0.0.1:8080
+```
+
+##### 桥接
+
+```bash
+qemu-system-x86_64 \
+-m 2G -smp 2 -machine accel=kvm -cpu host --nographic \
+-kernel bzImage \
+-device virtio-blk-pci, drive=disk0 -drive file=rootfs.ext4,format=raw,id=disk0,if=none \
+-device virtio-net-pci,netdev=net0 -netdev tap,id=net0,ifname=tap0 \
+-append "earlycon=pl011,mmio32,0x9000000 console=ttyS0,115200 root=/dev/vda"
+```
+
+指定-netdev tap，id=net0指的是guest中该网卡的名字，ifname=tap0指的是host中的tap网卡名，在host中配置tap桥接的过程这里就不重复了。
+
+若要使用vhost加速则加上vhost=on
+
+```bash
+-device virtio-net-pci,netdev=net0 -netdev tap,id=net0,ifname=tap0,vhost=on \
+```
+
+#### gdb调试内核
+
+```bash
+qemu-system-x86_64 \
+-m 2G -smp 2 --nographic \
+-kernel bzImage \
+-device virtio-blk-pci,drive=disk0 -drive file=rootfs.ext4,format=raw,id=disk0,if=none \
+-append "earlycon=pl011,mmio32,0x9000000 console=ttyS0,115200 root=/dev/vda nokaslr" -S -s
+```
+
+在使用KVM时，可能会存在gdb无法访问到的内存，因此在调试时为了方便建议去掉kvm的使用。此外在x86以及armv8以下的版本中存在内核地址空间布局随机化(KASLR)功能，它会导致gdb无法正确找到符号的正确地址，因此需要在启动参数中添加nokaslr来关闭此功能。
+
+bzImage是没有带符号表的，因此在调试内核时需要使用vmlinux，在编译内核时需要注意打开DEBUG_INFO_DWARF4选项，vmlinux才支持调试。
+
+```bash
+	$ file vmlinux
+vmlinux: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, BuildID[sha1]=420c91c5390c0a455a8388f1439e6fe54ce57b6e, with debug_info, not stripped
+```
+
+vmlinux中需要带with debug_info, not stripped这两个标识。
+
+在qemu中带上-S -s命令，其中-S表示等待gdb发送c指令才运行，-s表示指定远程调试的端口默认为1234。
+
+```bash
+	$ gdb
+(gdb) symbol-file vmlinux
+Reading symbols from vmlinux...
+(gdb) target remote 127.0.0.1:1234
+Remote debugging using 127.0.0.1:1234
+0x000000000000fff0 in exception_stacks ()
+(gdb) b start_kernel
+Breakpoint 1 at 0xffffffff82dd48c0: file init/main.c, line 904.
+(gdb) c
+Continuing.
+
+Thread 1 hit Breakpoint 1, start_kernel () at init/main.c:904
+904     {
+(gdb) 
+```
+
+#### gdb调试内核模块
+
+先正常启动一个内核
+
+```bash
+qemu-system-x86_64 \
+-m 2G -smp 2 --nographic \
+-kernel bzImage \
+-device virtio-blk-pci,drive=disk0 -drive file=rootfs.ext4,format=raw,id=disk0,if=none \
+-append "earlycon=pl011,mmio32,0x9000000 console=ttyS0,115200 root=/dev/vda nokaslr" -S -s
+```
+
+在host中gdb直接输入c继续运行
+
+```bash
+	$ gdb
+(gdb) symbol-file vmlinux
+Reading symbols from vmlinux...
+(gdb) target remote 127.0.0.1:1234
+Remote debugging using 127.0.0.1:1234
+0x000000000000fff0 in exception_stacks ()
+(gdb) c
+Continuing.
+```
+
+在guest中
+
+```bash
+	$ insmod test.ko
+	$ cat /proc/modules 
+test 12288 0 - Live 0xffffffffc0000000 (O)
+```
+
+在host中gdb使用ctrl+c打断c指令状态，并导入模块加内核加载地址，并打断点，输入c继续
+
+```bash
+(gdb) c
+Continuing.
+^C
+(gdb) add-symbol-file ../kvm/vm/work/ko/test.ko 0xffffffffc0000000
+(gdb) b sema_init
+Breakpoint 2 at 0xffffffff815c353a: sema_init. (9 locations)
+(gdb) c
+Continuing.
+```
+
+在guest中，运行用户态测试代码
+
+```bash
+./test
+```
+
+在host中gdb看到打断
+
+```bash
+(gdb) c
+Continuing.
+[Switching to Thread 1.1]
+
+Thread 1 hit Breakpoint 2.7, vxdma_mod_exit () at test.c:139
+139             file->private_data = vc;
+(gdb)
+```
+
 ## Docker
 
 ### Docker 的使用
@@ -205,7 +402,7 @@ docker pull ubuntu
 
 ---
 
-下载完毕后查看此镜像
+下载完毕后查看此镜像 
 
 ```bash
 docker images
@@ -374,3 +571,73 @@ docker container prune
 ```bash
 docker image prune -a
 ```
+
+## virt-net
+
+### Linux Bridge 桥接
+
+安装Linux Bridge工具
+
+```bash
+apt install bridge-utils
+```
+
+使用Linux Bridge创建网桥，将eth0与tap0桥接
+
+```bash
+ip link add name br0 type bridge
+ip link set br0 up
+ip link set eth0 down
+ip link set eth0 master br0
+ip link set eth0 up
+dhclient br0
+ip tuntap add tap0 mode tap
+ip link set tap0 master br0
+ip link set tap0 up
+```
+
+删除网桥
+
+```
+ip link set tap0 down
+ip tuntap del tap0 mode tap
+brctl delbr br0
+```
+
+### Open vSwitch 桥接
+
+安装Open vSwitch(OVS)工具。
+
+```bash
+sudo apt install openvswitch-switch
+```
+
+OVS有一个后台服务，需要确保其运行起来。
+
+```bash
+systemctl start openvswitch-switch.service
+```
+
+使用ovs创建网桥，将eth0与tap0桥接
+
+```bash
+ovs-vsctl add-br br0
+ip link set br0 up
+ip link set eth0 down
+ovs-vsctl add-port br0 eth0
+ip link set eth0 up
+dhclient br0
+ip tuntap add tap0 mode tap
+ovs-vsctl add-port br0 tap0
+ip link set tap0 up
+```
+
+删除网桥
+
+```bash
+ovs-vsctl del-port br0 eth0
+ovs-vsctl del-port br0 tap0
+ovs-vsctl del-br br0
+systemctl stop openvswitch-switch
+```
+
