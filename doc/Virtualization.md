@@ -1,6 +1,6 @@
 # Virtualization
 
-## kvm
+## Kvm
 
 kvm是linux内核提供的guest，内核通过字符设备/dev/kvm暴露操作接口，主要使用ioctl操作实现guest的创建和资源分配。
 
@@ -193,11 +193,11 @@ lrwxrwxrwx 1 root root 0 10月30日 14:32 driver -> ../../../../bus/pci/drivers/
 00:00.0 Memory controller: Xilinx Corporation Device 9034
 ```
 
-### qemu
+## Qemu
 
 qemu能真正模拟不同的硬件，它支持模拟与host架构硬件同时支持BootLoader启动。直接使用kvm只能通过virtio驱动来模拟硬件，并且无法实现BootLoader支持。
 
-#### 内核启动
+### 内核启动
 
 ```bash
 qemu-system-x86_64 \
@@ -214,7 +214,7 @@ qemu-system-aarch64 -M virt -cpu cortex-a53 -m 2G --nographic \
 -kernel Image 
 ```
 
-#### 指定根文件系统
+### 指定根文件系统
 
 qemu并没有默认的文件系统，需要手动指定。
 
@@ -230,9 +230,9 @@ qemu-system-x86_64 \
 
 -append 可以指定启动参数，将earlycon打开可以查看启动过程中的内核打印，方便定位启动失败问题，earlycon=pl011,mmio32,0x9000000是qemu默认模拟的串口。指定root=/dev/vda可以指定根文件系统为传入的rootfs.ext4。
 
-#### 网络
+### 网络
 
-##### nat
+#### nat
 
 ```bash
 qemu-system-x86_64 \
@@ -249,7 +249,7 @@ qemu-system-x86_64 \
 ssh 127.0.0.1:8080
 ```
 
-##### 桥接
+#### 桥接
 
 ```bash
 qemu-system-x86_64 \
@@ -268,7 +268,7 @@ qemu-system-x86_64 \
 -device virtio-net-pci,netdev=net0 -netdev tap,id=net0,ifname=tap0,vhost=on \
 ```
 
-#### gdb调试内核
+### gdb调试内核
 
 ```bash
 qemu-system-x86_64 \
@@ -308,7 +308,7 @@ Thread 1 hit Breakpoint 1, start_kernel () at init/main.c:904
 (gdb) 
 ```
 
-#### gdb调试内核模块
+### gdb调试内核模块
 
 先正常启动一个内核
 
@@ -371,6 +371,42 @@ Thread 1 hit Breakpoint 2.7, vxdma_mod_exit () at test.c:139
 139             file->private_data = vc;
 (gdb)
 ```
+
+## Namespace
+
+在 Linux 中，命名空间（namespace） 是一种用于隔离系统资源的机制。它允许将一组进程与系统的某些资源（如网络、进程、挂载点等）隔离开来，仿佛每组进程都运行在一个独立的系统中。这种隔离是容器技术（如 Docker）能够实现轻量级虚拟化的基础之一。
+
+Linux 中有几种类型的命名空间，每种类型负责隔离不同的系统资源：
+
+### PID 命名空间
+
+host中的1号进程在启动时会fork出dockerd，dockerd在收到docker run的信号时会创建一个PID命名空间，然后在这个命名空间里fork出一个新的1号进程来，这个新的进程就是docker中指定的文件系统中的init或systemd。然后docker中的剩余进程都是通过fork这个PID命名空间中的1号进程获取的。
+
+### NET命名空间
+
+创建网络命名空间后，这个网络命名空间可以创建与host完全不同的路由表和防火墙规则，这些规则会在访问绑定到这个网络命名空间中的虚拟网卡时生效。
+
+### IPC命名空间
+
+实现IPC的方式有 System V IPC 和 POSIX IPC。其中System V IPC是通过key值做进程间通信的。在不同的 IPC 命名空间中，System V IPC 资源是隔离的，因此相同的 key 在不同的命名空间中会创建不同的 IPC 对象，无法共享。因此 System V IPC 完全无法在不同的 IPC 命名空间中共享。
+
+POSIX IPC 通常使用文件系统路径，例如在创建共享内存IPC时会创建/dev/shm这样的节点。通过挂载的方式，能将文件系统节点挂载到docker中实现IPC通信。
+
+### MNT命名空间
+
+每个挂载命名空间可以拥有不同的挂载点视图，从而使容器能够独立挂载文件系统，而不会影响其他容器或主机。
+
+### UTS命名空间
+
+隔离系统的主机名和域名。这允许每个容器有独立的主机名，从而可以模拟多台主机的环境。
+
+### USER命名空间
+
+隔离用户和组 ID，允许在容器内映射不同的用户 ID，在docker中使用--privileged指定特权模式后，容器内的 root 用户权限几乎与宿主机的 root 用户相同。
+
+### CGROUP命名空间
+
+cgroup可以限制每个进程使用的内存、CPU、IO速率、网络带宽、块设备权限等，cgroup命名空间中创建的cgroup组，无法看见host中的cgroup。
 
 ## Docker
 
@@ -572,7 +608,7 @@ docker container prune
 docker image prune -a
 ```
 
-## virt-net
+## Virt-net
 
 ### Linux Bridge 桥接
 
@@ -640,4 +676,28 @@ ovs-vsctl del-port br0 tap0
 ovs-vsctl del-br br0
 systemctl stop openvswitch-switch
 ```
+
+## 特权指令
+
+特权指令和非特权指令的权限区别在于访问硬件资源的能力，在特权模式下可以访问硬件资源，而非特权模式下不行。
+
+例如只有在特权模式下可以操作中断控制器，MMU，IOMMU，设置处理器模式等动作。
+
+Linux用户态下是非特权模式，它无法直接访问一些硬件资源，同时它也无法直接通过操作CPU寄存器设置处理器模式为特权模式，因此用户态想要主动访问硬件资源就需要通过系统调用。
+
+在用户态下发起系统调用后，系统会进入一个软中断，而在中断回调是在内核产生的，这时CPU就会自动进入特权模式，再由软中断回调中跳转到对应的内核服务中。在进入软中断前，会保存当前用户态进程的上下文，内核服务执行完毕后恢复到用户进程产生中断的位置。如果在内核服务中陷入了休眠，则此时调度器重新选择调度任务，因为调度器是内核态的代码，因此调度器可以做特权模式的切换切换到非特权模式让CPU运行用户进程，也可以让CPU保持特权模式让CPU运行内核进程。
+
+内核态的MMU页表是统一的，而不用用户态进程的页表是不一样的，用户态的页表在映射时会有一个编号，内核态在拿到用户态页表的编号后，填入MMU寄存器才能正确访问到用户态的虚拟地址，因此内核态通常会使用copy_to_user和copy_from_user来获取用户态的数据，或者直接用mmap让内核态的数据映射给用户态使用。
+
+
+
+
+
+
+
+
+
+
+
+
 
